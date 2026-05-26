@@ -4,5 +4,5 @@ numpy
 rdkit
 unimol-tools
 py3Dmol
-streamlit-molstar
 torch
+huggingface_hub
