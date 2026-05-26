@@ -6,136 +6,113 @@ import numpy as np
 import torch
 import shutil
 import yaml
-from unimol_tools import MolPredict
-from rdkit import Chem
-from rdkit.Chem import AllChem
-import py3Dmol
+import gc  # 垃圾回收
 
-# --- 1. 环境初始化：重定向所有路径到 /tmp ---
-os.environ['UNIMOL_WEIGHT_DIR'] = '/tmp/unimol_weights'
+# --- 1. 极限内存优化：强制 Torch 最小化资源占用 ---
+torch.set_num_threads(1)
+torch.set_grad_enabled(False) # 禁用梯度计算，节省大量内存
+
+# --- 2. 路径重定向 ---
+# 注意：为了节省内存，我们直接在 /tmp 操作，减少文件拷贝带来的开销
+target_weight_dir = '/tmp/unimol_weights'
+os.environ['UNIMOL_WEIGHT_DIR'] = target_weight_dir
 os.environ['HF_HOME'] = '/tmp/huggingface'
-os.environ['HF_HUB_OFFLINE'] = '0' 
 
 def bootstrap_unimol():
-    local_weight_dir = './model_weight'
-    target_weight_dir = os.environ['UNIMOL_WEIGHT_DIR']
-    
     if not os.path.exists(target_weight_dir):
         os.makedirs(target_weight_dir, exist_ok=True)
     
-    # A. 搬运仓库中的所有文件
-    if os.path.exists(local_weight_dir):
-        for f in os.listdir(local_weight_dir):
-            shutil.copy(os.path.join(local_weight_dir, f), os.path.join(target_weight_dir, f))
-
-    # B. 基础权重补丁 (mol_pre_all_h_220816.pt)
+    # A. 基础权重 (mol_pre_all_h_220816.pt) - 仅当不存在时下载
     foundation_name = 'mol_pre_all_h_220816.pt'
     foundation_path = os.path.join(target_weight_dir, foundation_name)
     if not os.path.exists(foundation_path):
         url = f"https://huggingface.co/dptech/Uni-Mol-Models/resolve/main/{foundation_name}"
-        with st.spinner("正在初始化基础环境，请稍候..."):
-            r = requests.get(url, stream=True)
-            with open(foundation_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192): f.write(chunk)
-
-    # C. 权重重命名补丁 (确保有 model_0.pth)
-    target_m0 = os.path.join(target_weight_dir, 'model_0.pth')
-    if not os.path.exists(target_m0):
-        pth_files = [f for f in os.listdir(target_weight_dir) if f.endswith('.pth') and f != foundation_name]
+        r = requests.get(url, stream=True)
+        with open(foundation_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=1024*1024): f.write(chunk)
+    
+    # B. 搬运仓库文件 (使用软链接或直接读取以省空间，这里采用直接覆盖)
+    local_dir = './model_weight'
+    if os.path.exists(local_dir):
+        for f in ['config.yaml', 'mol.dict.txt', 'threshold.dat']:
+            src = os.path.join(local_dir, f)
+            if os.path.exists(src):
+                shutil.copy(src, os.path.join(target_weight_dir, f))
+        
+        # 寻找微调权重并重命名为 model_0.pth
+        pth_files = [f for f in os.listdir(local_dir) if f.endswith('.pth') and f != foundation_name]
         if pth_files:
-            shutil.copy(os.path.join(target_weight_dir, pth_files[0]), target_m0)
+            shutil.copy(os.path.join(local_dir, pth_files[0]), os.path.join(target_weight_dir, 'model_0.pth'))
 
-    # D. 配置文件强力补丁 (解决 TypeError)
-    config_path = os.path.join(target_weight_dir, 'config.yaml')
-    try:
-        conf = None
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                conf = yaml.safe_load(f)
-        
-        # 如果文件不存在或内容为空，创建一个基础配置
-        if conf is None or not isinstance(conf, dict):
-            conf = {
-                'task': 'classification',
-                'model_name': 'unimolv1',
-                'data_type': 'molecule',
-                'metrics': 'auc'
-            }
-        
-        # 强制设为单折推理，防止报错
-        conf['kfold'] = 1
-        
-        with open(config_path, 'w') as f:
-            yaml.dump(conf, f)
-    except Exception as e:
-        st.warning(f"配置修复提示: {e}，正在尝试跳过...")
+    # C. 强制修改配置为单折，极其重要
+    conf_p = os.path.join(target_weight_dir, 'config.yaml')
+    conf = {'task': 'classification', 'model_name': 'unimolv1', 'kfold': 1} # 默认最小配置
+    if os.path.exists(conf_p):
+        try:
+            with open(conf_p, 'r') as f:
+                user_conf = yaml.safe_load(f)
+                if user_conf: conf.update(user_conf)
+        except: pass
+    conf['kfold'] = 1
+    with open(conf_p, 'w') as f: yaml.dump(conf, f)
 
-# 执行环境自愈
-bootstrap_unimol()
-
-# --- 2. 加载模型 ---
+# --- 3. 延迟加载策略：不在启动时加载模型，而是在第一次使用时加载 ---
 @st.cache_resource
-def load_unimol_model():
-    try:
-        # 直接传路径，位置参数匹配
-        return MolPredict(os.environ['UNIMOL_WEIGHT_DIR'])
-    except Exception as e:
-        st.error(f"核心加载失败: {e}")
-        return None
+def get_predictor():
+    from unimol_tools import MolPredict # 延迟导入
+    bootstrap_unimol()
+    predictor = MolPredict(target_weight_dir)
+    gc.collect() # 加载完立即释放无关内存
+    return predictor
 
-predictor = load_unimol_model()
+# --- 4. UI 界面 ---
+st.set_page_config(page_title="Uni-Mol BBB", page_icon="🧪")
+st.title("🧪 Uni-Mol BBB 在线预测")
 
-# --- 3. UI 界面与预测逻辑 ---
-st.set_page_config(page_title="Uni-Mol BBB 预测", page_icon="🧪")
-st.title("🧪 Uni-Mol 分子血脑屏障穿透性预测")
-
-# 侧边栏
-st.sidebar.header("上市药物预测对比")
+# 侧边栏示例
 drug_examples = {
     "请选择...": "",
-    "地西泮 (Diazepam, 镇静药)": "CN1C(=O)CN=C(C2=C1C=CC(=C2)Cl)C3=CC=CC=C3",
-    "多奈哌齐 (Donepezil, 抗痴呆)": "COC1=C(C=C2C(=C1)CC(C2=O)CC3CCN(CC3)CC4=CC=CC=C4)OC",
-    "阿替洛尔 (Atenolol, 降压药)": "CC(C)NCC(COC1=CC=C(C=C1)CC(N)=O)O",
-    "氟西汀 (Fluoxetine, 抗抑郁)": "CNCCC(C1=CC=CC=C1)OC2=CC=C(C=C2)C(F)(F)F"
+    "地西泮 (能穿透)": "CN1C(=O)CN=C(C2=C1C=CC(=C2)Cl)C3=CC=CC=C3",
+    "阿替洛尔 (难穿透)": "CC(C)NCC(COC1=CC=C(C=C1)CC(N)=O)O",
 }
-selected = st.sidebar.selectbox("查看已知药物的表现:", list(drug_examples.keys()))
+selected = st.sidebar.selectbox("示例药物:", list(drug_examples.keys()))
+input_smi = st.text_input("输入 SMILES:", value=drug_examples[selected] if selected != "请选择..." else "")
 
-input_smi = st.text_input("或输入自定义 SMILES 结构:", value=drug_examples[selected] if selected != "请选择..." else "")
-
-if st.button("开始 3D 深度分析", type="primary"):
-    if predictor and input_smi:
+if st.button("开始分析", type="primary"):
+    if input_smi:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        import py3Dmol
+        
         mol = Chem.MolFromSmiles(input_smi)
         if mol:
-            with st.spinner('模型正在通过 3D 构象感知分子极性与脂溶性...'):
+            with st.spinner('模型载入与 3D 计算中... (可能需要1分钟)'):
                 try:
+                    predictor = get_predictor() # 这里才会真正占用大内存
                     raw_preds = np.array(predictor.predict([input_smi]))
-                    # 适配输出维度
-                    prob = float(raw_preds[0][1]) if raw_preds.ndim > 1 and raw_preds.shape[1] > 1 else float(raw_preds[0][0])
+                    prob = float(raw_preds[0][1]) if raw_preds.ndim > 1 else float(raw_preds[0][0])
                     
                     st.divider()
-                    col1, col2 = st.columns([1, 1.2])
-                    with col1:
-                        st.subheader("预测结论")
-                        # 使用训练时确定的最佳阈值 0.5789
-                        if prob > 0.5789:
-                            st.success("### 【能穿透】\n中枢神经系统活跃")
-                        else:
-                            st.error("### 【难穿透】\n外周分布为主")
-                        st.metric("模型综合评分", f"{prob:.4f}")
-                        st.write(f"分子量: {AllChem.CalcExactMolWt(mol):.2f} Da")
+                    c1, c2 = st.columns([1, 1.2])
+                    with c1:
+                        if prob > 0.5789: st.success("### 能穿透")
+                        else: st.error("### 难穿透")
+                        st.metric("概率评分", f"{prob:.4f}")
+                        st.write(f"MW: {AllChem.CalcExactMolWt(mol):.1f}")
                     
-                    with col2:
-                        st.subheader("3D 预览")
+                    with c2:
                         m3d = Chem.AddHs(mol)
                         AllChem.EmbedMolecule(m3d, AllChem.ETKDG())
-                        st.components.v1.html(
-                            py3Dmol.view(width=400, height=300).addModel(Chem.MolToMolBlock(m3d), 'mol').setStyle({'stick':{'colorscheme':'greenCarbon'}, 'sphere':{'scale':0.3}}).zoomTo()._make_html(), 
-                            height=320
-                        )
-                except Exception as e:
-                    st.error(f"推理引擎异常: {e}")
-        else:
-            st.error("❌ 无效的 SMILES 字符串，无法解析")
+                        st.components.v1.html(py3Dmol.view(width=350, height=250).addModel(Chem.MolToMolBlock(m3d), 'mol').setStyle({'stick':{}, 'sphere':{'scale':0.3}}).zoomTo()._make_html(), height=260)
+                    
+                    # 预测完手动清理
+                    del raw_preds
+                    gc.collect()
 
-st.divider()
-st.caption("技术详情: Uni-Mol (Transformer 架构) | 任务: BBBP 迁移学习 | 验证集 ROC-AUC: 0.92")
+                except Exception as e:
+                    st.error(f"内存不足或计算错误: {e}")
+                    st.info("请尝试点击右侧的 Reboot App")
+        else:
+            st.error("无效 SMILES")
+
+st.caption("注：免费版内存有限。若崩溃，请刷新页面或等待系统回收资源。")
