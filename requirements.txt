@@ -4,5 +4,5 @@ numpy
 rdkit
 unimol-tools
 py3Dmol
-st-molstar
+streamlit-molstar
 torch
