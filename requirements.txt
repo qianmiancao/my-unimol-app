@@ -6,3 +6,4 @@ unimol-tools
 py3Dmol
 torch
 huggingface_hub
+PyYAML
